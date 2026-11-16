@@ -1,7 +1,8 @@
 #[cfg(feature = "scard")]
 use picky_krb::constants::error_codes::KDC_ERR_ETYPE_NOSUPP;
-use picky_krb::constants::error_codes::KRB_AP_ERR_SKEW;
-use picky_krb::data_types::KrbResult;
+use picky_asn1::restricted_string::IA5String;
+use picky_krb::constants::error_codes::{KDC_ERR_WRONG_REALM, KRB_AP_ERR_SKEW};
+use picky_krb::data_types::{KerberosStringAsn1, KrbResult, Realm};
 use picky_krb::messages::{AsRep, AsReq, KdcReqBody, KrbError};
 use time::{Duration, OffsetDateTime};
 
@@ -13,6 +14,9 @@ use crate::kerberos::pa_datas::AsReqPaDataOptions;
 #[cfg(feature = "scard")]
 use crate::pk_init::KeyAgreement;
 use crate::{CredentialsBuffers, Error, ErrorKind, Kerberos, Result, Secret};
+
+/// Maximum number of client referrals to follow in the AS exchange.
+const MAX_REFERRAL_HOPS: usize = 5;
 
 pub(crate) enum AsExchangeOutput {
     SendRequest(AsReq),
@@ -37,6 +41,7 @@ pub struct AsExchange {
     state: AsExchangeState,
     kdc_req_body: KdcReqBody,
     retried_skew: bool,
+    hops: usize,
     // Instead of storing the `AsReqPaDataOptions` directly, we store its individual components (fields below).
     // This design avoids introducing lifetime requirement that would require huge refactoring.
     // The `AsReqPaDataOptions` is cheaply reconstructed at each step using the `build_pa_data_options` method.
@@ -60,6 +65,7 @@ impl AsExchange {
             state: AsExchangeState::Initial,
             kdc_req_body,
             retried_skew: false,
+            hops: 0,
             password,
             salt,
             #[cfg(feature = "scard")]
@@ -107,6 +113,13 @@ impl AsExchange {
                     }
 
                     let krb_error = as_rep.unwrap_err();
+
+                    if krb_error.0.error_code.0 == KDC_ERR_WRONG_REALM {
+                        self.follow_client_referral(client, &krb_error)?;
+                        self.state = AsExchangeState::Initial;
+
+                        continue;
+                    }
 
                     if is_smart_card_preauth_hint(credentials, &krb_error) {
                         debug!(
@@ -166,6 +179,11 @@ impl AsExchange {
                             self.state = AsExchangeState::AsRequest;
                             continue;
                         }
+                        Err(err) if err.0.error_code.0 == KDC_ERR_WRONG_REALM => {
+                            self.follow_client_referral(client, &err)?;
+                            self.state = AsExchangeState::Initial;
+                            continue;
+                        }
                         Err(err) => {
                             error!(?err, "AS exchange error");
                             return Err(err.into());
@@ -174,6 +192,52 @@ impl AsExchange {
                 }
             }
         }
+    }
+
+    /// Retargets the AS-REQ at the realm named by a `KDC_ERR_WRONG_REALM` error
+    /// ([RFC 6806, section 7](https://www.rfc-editor.org/rfc/rfc6806#section-7)).
+    fn follow_client_referral(&mut self, client: &mut Kerberos, error: &KrbError) -> Result<()> {
+        let current_realm = self.kdc_req_body.realm.0.0.as_utf8().to_owned();
+
+        let next_realm = error
+            .0
+            .crealm
+            .0
+            .as_ref()
+            .map(|crealm| crealm.0.0.as_utf8().to_owned())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NoAuthenticatingAuthority,
+                    format!("KDC_ERR_WRONG_REALM from realm `{current_realm}` does not name a referral realm"),
+                )
+            })?;
+
+        self.hops += 1;
+        if self.hops > MAX_REFERRAL_HOPS {
+            return Err(Error::new(
+                ErrorKind::NoAuthenticatingAuthority,
+                format!("exceeded maximum Kerberos client referral hops ({MAX_REFERRAL_HOPS}) in the AS exchange"),
+            ));
+        }
+        if next_realm.eq_ignore_ascii_case(&current_realm) {
+            return Err(Error::new(
+                ErrorKind::NoAuthenticatingAuthority,
+                format!("Kerberos client referral did not progress past realm `{current_realm}`"),
+            ));
+        }
+
+        debug!(%current_realm, %next_realm, "Received client referral; retargeting AS-REQ at referral realm");
+
+        let krbtgt_realm = KerberosStringAsn1::from(IA5String::from_string(next_realm.clone())?);
+        if let Some(sname) = self.kdc_req_body.sname.0.as_mut() {
+            if let Some(realm_component) = sname.0.name_string.0.0.get_mut(1) {
+                *realm_component = krbtgt_realm;
+            }
+        }
+        self.kdc_req_body.realm.0 = Realm::from(IA5String::from_string(next_realm.clone())?);
+        client.realm = Some(next_realm);
+
+        Ok(())
     }
 
     fn build_pa_data_options<'a>(
@@ -256,4 +320,131 @@ pub(crate) fn clock_offset_from_error(error: &KrbError, received_at: OffsetDateT
         .checked_add(Duration::microseconds(i64::from(microseconds)))
         .ok_or_else(|| Error::new(ErrorKind::InvalidToken, "KDC skew error has invalid server time"))?;
     Ok(server_time - received_at)
+}
+
+#[cfg(test)]
+mod tests {
+    use picky_asn1::wrapper::{
+        Asn1SequenceOf, ExplicitContextTag0, ExplicitContextTag1, ExplicitContextTag4, ExplicitContextTag5,
+        ExplicitContextTag6, ExplicitContextTag7, ExplicitContextTag9, ExplicitContextTag10, IntegerAsn1, Optional,
+    };
+    use picky_krb::data_types::{KerberosTime, Microseconds, PrincipalName};
+    use picky_krb::messages::KrbErrorInner;
+    use rand_core::SeedableRng;
+    use super::*;
+    use crate::ClientRequestFlags;
+    use crate::kerberos::client::generators::{GenerateAsReqOptions, generate_as_req_kdc_body};
+    use crate::kerberos::config::KerberosConfig;
+
+    fn realm(name: &str) -> Realm {
+        Realm::from(IA5String::from_string(name.to_owned()).unwrap())
+    }
+
+    fn wrong_realm_error(crealm: Option<&str>) -> KrbError {
+        KrbError::from(KrbErrorInner {
+            pvno: ExplicitContextTag0::from(IntegerAsn1::from(vec![5])),
+            msg_type: ExplicitContextTag1::from(IntegerAsn1::from(vec![30])),
+            ctime: Optional::from(None),
+            cusec: Optional::from(None),
+            stime: ExplicitContextTag4::from(KerberosTime::from(picky_asn1::date::GeneralizedTime::from(
+                OffsetDateTime::UNIX_EPOCH,
+            ))),
+            susec: ExplicitContextTag5::from(Microseconds::from(vec![0])),
+            error_code: ExplicitContextTag6::from(KDC_ERR_WRONG_REALM),
+            crealm: Optional::from(crealm.map(|name| ExplicitContextTag7::from(realm(name)))),
+            cname: Optional::from(None),
+            realm: ExplicitContextTag9::from(realm("EXAMPLE.COM")),
+            sname: ExplicitContextTag10::from(PrincipalName {
+                name_type: ExplicitContextTag0::from(IntegerAsn1::from(vec![2])),
+                name_string: ExplicitContextTag1::from(Asn1SequenceOf::from(vec![
+                    KerberosStringAsn1::from(IA5String::from_string("krbtgt".to_owned()).unwrap()),
+                    KerberosStringAsn1::from(IA5String::from_string("EXAMPLE.COM".to_owned()).unwrap()),
+                ])),
+            }),
+            e_text: Optional::from(None),
+            e_data: Optional::from(None),
+        })
+    }
+
+    fn exchange_for(realm_name: &str) -> (AsExchange, Kerberos) {
+        let body = generate_as_req_kdc_body(&GenerateAsReqOptions {
+            realm: realm_name,
+            username: "alice",
+            cname_type: 1,
+            snames: &["krbtgt", realm_name],
+            nonce: 1,
+            hostname: "host",
+            context_requirements: ClientRequestFlags::empty(),
+        })
+        .unwrap();
+        let client = Kerberos::new_client_from_config(KerberosConfig::new_with_kdc_url(
+            "tcp://kdc.example.com:88",
+            "host".into(),
+        ))
+        .unwrap();
+        let exchange = AsExchange::new(
+            body,
+            Secret::new(String::new()),
+            Vec::new(),
+            #[cfg(feature = "scard")]
+            KeyAgreement::Dh(crate::pku2u::generate_client_dh_parameters(
+                &mut rand::rngs::StdRng::try_from_rng(&mut rand::rngs::SysRng).unwrap(),
+            )),
+            #[cfg(feature = "scard")]
+            0,
+        );
+        (exchange, client)
+    }
+
+    #[test]
+    fn wrong_realm_retargets_request_at_referral_realm_keeping_client_name() {
+        let (mut exchange, mut client) = exchange_for("EXAMPLE.COM");
+
+        exchange
+            .follow_client_referral(&mut client, &wrong_realm_error(Some("CORP.EXAMPLE.COM")))
+            .unwrap();
+
+        let body = &exchange.kdc_req_body;
+        assert_eq!(body.realm.0.0.as_utf8(), "CORP.EXAMPLE.COM");
+        let sname = &body.sname.0.as_ref().unwrap().0.name_string.0.0;
+        assert_eq!(sname[0].0.as_utf8(), "krbtgt");
+        assert_eq!(sname[1].0.as_utf8(), "CORP.EXAMPLE.COM");
+        assert_eq!(body.cname.0.as_ref().unwrap().0.name_string.0.0[0].0.as_utf8(), "alice");
+        assert_eq!(client.realm.as_deref(), Some("CORP.EXAMPLE.COM"));
+    }
+
+    #[test]
+    fn wrong_realm_without_referral_realm_fails() {
+        let (mut exchange, mut client) = exchange_for("EXAMPLE.COM");
+
+        assert!(exchange.follow_client_referral(&mut client, &wrong_realm_error(None)).is_err());
+    }
+
+    #[test]
+    fn wrong_realm_pointing_at_same_realm_fails() {
+        let (mut exchange, mut client) = exchange_for("EXAMPLE.COM");
+
+        assert!(
+            exchange
+                .follow_client_referral(&mut client, &wrong_realm_error(Some("example.com")))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn referrals_are_limited() {
+        let (mut exchange, mut client) = exchange_for("R0.EXAMPLE.COM");
+
+        for hop in 1..=MAX_REFERRAL_HOPS {
+            exchange
+                .follow_client_referral(&mut client, &wrong_realm_error(Some(&format!("R{hop}.EXAMPLE.COM"))))
+                .unwrap();
+        }
+
+        assert!(
+            exchange
+                .follow_client_referral(&mut client, &wrong_realm_error(Some("LAST.EXAMPLE.COM")))
+                .is_err()
+        );
+    }
 }
