@@ -262,6 +262,7 @@ impl Kerberos {
         data: &[u8],
         detect: impl FnOnce(&str) -> Vec<Url>,
     ) -> Result<Vec<u8>> {
+        warn!("Sending Kerberos message to realm `{realm}`");
         let mut last_error = None;
         let mut already_tried = None;
         // Realms are case-insensitive, so normalize the cache key to avoid duplicate entries.
@@ -269,6 +270,7 @@ impl Kerberos {
 
         // Prefer the KDC that last answered for this realm (stickiness across messages).
         if let Some(pinned) = self.kdc_cache.get(&cache_key).cloned() {
+            warn!("Pinned KDC for: {pinned}");
             match self.send_to(yield_point, realm, pinned.clone(), data).await {
                 Ok(response) => return Ok(response),
                 Err(error) => {
@@ -281,6 +283,7 @@ impl Kerberos {
         }
 
         let kdc_urls = select_kdc_urls(realm, self.realm.as_deref(), &self.config.kdc_resolution, detect);
+        warn!("select_kdc_urls: {:?}", kdc_urls);
         if kdc_urls.is_empty() {
             return Err(last_error.unwrap_or_else(|| {
                 Error::new(
@@ -330,6 +333,7 @@ impl Kerberos {
         kdc_url: Url,
         data: &[u8],
     ) -> Result<Vec<u8>> {
+        warn!("send_to KDC {:?} for realm {:?}", kdc_url, realm);
         let protocol = NetworkProtocol::from_url_scheme(kdc_url.scheme()).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidParameter,

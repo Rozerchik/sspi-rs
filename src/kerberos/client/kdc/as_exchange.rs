@@ -1,6 +1,6 @@
+use picky_asn1::restricted_string::IA5String;
 #[cfg(feature = "scard")]
 use picky_krb::constants::error_codes::KDC_ERR_ETYPE_NOSUPP;
-use picky_asn1::restricted_string::IA5String;
 use picky_krb::constants::error_codes::{KDC_ERR_WRONG_REALM, KRB_AP_ERR_SKEW};
 use picky_krb::data_types::{KerberosStringAsn1, KrbResult, Realm};
 use picky_krb::messages::{AsRep, AsReq, KdcReqBody, KrbError};
@@ -18,6 +18,7 @@ use crate::{CredentialsBuffers, Error, ErrorKind, Kerberos, Result, Secret};
 /// Maximum number of client referrals to follow in the AS exchange.
 const MAX_REFERRAL_HOPS: usize = 5;
 
+#[derive(Debug)]
 pub(crate) enum AsExchangeOutput {
     SendRequest(AsReq),
     Done(AsRep, String),
@@ -113,6 +114,8 @@ impl AsExchange {
                     }
 
                     let krb_error = as_rep.unwrap_err();
+
+                    warn!(?krb_error, "KDC replied with KRB_ERROR to the AS_REQ");
 
                     if krb_error.0.error_code.0 == KDC_ERR_WRONG_REALM {
                         self.follow_client_referral(client, &krb_error)?;
@@ -229,10 +232,10 @@ impl AsExchange {
         debug!(%current_realm, %next_realm, "Received client referral; retargeting AS-REQ at referral realm");
 
         let krbtgt_realm = KerberosStringAsn1::from(IA5String::from_string(next_realm.clone())?);
-        if let Some(sname) = self.kdc_req_body.sname.0.as_mut() {
-            if let Some(realm_component) = sname.0.name_string.0.0.get_mut(1) {
-                *realm_component = krbtgt_realm;
-            }
+        if let Some(sname) = self.kdc_req_body.sname.0.as_mut()
+            && let Some(realm_component) = sname.0.name_string.0.0.get_mut(1)
+        {
+            *realm_component = krbtgt_realm;
         }
         self.kdc_req_body.realm.0 = Realm::from(IA5String::from_string(next_realm.clone())?);
         client.realm = Some(next_realm);
@@ -324,6 +327,10 @@ pub(crate) fn clock_offset_from_error(error: &KrbError, received_at: OffsetDateT
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::ClientRequestFlags;
+    use crate::kerberos::client::generators::{GenerateAsReqOptions, generate_as_req_kdc_body};
+    use crate::kerberos::config::KerberosConfig;
     use picky_asn1::wrapper::{
         Asn1SequenceOf, ExplicitContextTag0, ExplicitContextTag1, ExplicitContextTag4, ExplicitContextTag5,
         ExplicitContextTag6, ExplicitContextTag7, ExplicitContextTag9, ExplicitContextTag10, IntegerAsn1, Optional,
@@ -331,10 +338,6 @@ mod tests {
     use picky_krb::data_types::{KerberosTime, Microseconds, PrincipalName};
     use picky_krb::messages::KrbErrorInner;
     use rand_core::SeedableRng;
-    use super::*;
-    use crate::ClientRequestFlags;
-    use crate::kerberos::client::generators::{GenerateAsReqOptions, generate_as_req_kdc_body};
-    use crate::kerberos::config::KerberosConfig;
 
     fn realm(name: &str) -> Realm {
         Realm::from(IA5String::from_string(name.to_owned()).unwrap())
@@ -417,7 +420,11 @@ mod tests {
     fn wrong_realm_without_referral_realm_fails() {
         let (mut exchange, mut client) = exchange_for("EXAMPLE.COM");
 
-        assert!(exchange.follow_client_referral(&mut client, &wrong_realm_error(None)).is_err());
+        assert!(
+            exchange
+                .follow_client_referral(&mut client, &wrong_realm_error(None))
+                .is_err()
+        );
     }
 
     #[test]

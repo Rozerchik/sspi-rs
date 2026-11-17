@@ -358,6 +358,7 @@ pub async fn initialize_security_context<'a>(
 
                                 let (as_rep, preauth_salt) = loop {
                                     let output = as_exchange.step(client, credentials, &as_response)?;
+                                    warn!("AS exchange output: {:?}", output);
                                     match output {
                                         AsExchangeOutput::SendRequest(as_req) => {
                                             as_response =
