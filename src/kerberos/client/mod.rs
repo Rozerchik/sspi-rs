@@ -284,6 +284,7 @@ pub async fn initialize_security_context<'a>(
 
                         let as_exchange = AsExchange::new(
                             kdc_req_body,
+                            realm,
                             credentials.extract_password(),
                             salt,
                             #[cfg(feature = "scard")]
@@ -324,7 +325,7 @@ pub async fn initialize_security_context<'a>(
                                     .unwrap_or_default();
 
                                 match as_exchange.step(client, credentials, input_token)? {
-                                    AsExchangeOutput::SendRequest(as_req) => {
+                                    AsExchangeOutput::SendRequest(as_req, _realm) => {
                                         let output_token =
                                             SecurityBuffer::find_buffer_mut(builder.output, BufferType::Token)?;
                                         output_token.buffer =
@@ -358,10 +359,11 @@ pub async fn initialize_security_context<'a>(
 
                                 let (as_rep, preauth_salt) = loop {
                                     let output = as_exchange.step(client, credentials, &as_response)?;
+                                    warn!("AS exchange output: {:?}", output);
                                     match output {
-                                        AsExchangeOutput::SendRequest(as_req) => {
+                                        AsExchangeOutput::SendRequest(as_req, realm) => {
                                             as_response =
-                                                client.send(yield_point, &serialize_message(&as_req)?).await?;
+                                                client.send_for_realm(yield_point, realm, &serialize_message(&as_req)?).await?;
                                         }
                                         AsExchangeOutput::Done(as_rep, preauth_salt) => {
                                             break (as_rep, preauth_salt);

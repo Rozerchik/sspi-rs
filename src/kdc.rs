@@ -67,20 +67,25 @@ fn krb5_kdc_values_to_hosts(kdcs: &[&str]) -> Vec<String> {
 #[instrument(ret, level = "debug")]
 pub(crate) fn detect_kdc_hosts(domain: &str) -> Vec<String> {
     if let Ok(kdc_url) = env::var(format!("SSPI_KDC_URL_{domain}")) {
+        warn!("detect_kdc_hosts: using KDC_URL from environment variable for domain `{domain}`: {kdc_url}");
         return vec![kdc_url];
     }
 
     if let Ok(kdc_url) = env::var("SSPI_KDC_URL") {
+        warn!("detect_kdc_hosts: using KDC_URL from environment variable: {kdc_url}");
         return vec![kdc_url];
     }
 
     let kdc_hosts = detect_kdc_hosts_from_system(domain);
+    warn!("detect_kdc_hosts: detected KDC hosts from system for domain `{domain}`: {:?}", kdc_hosts);
 
     if !kdc_hosts.is_empty() {
         return kdc_hosts;
     }
 
-    detect_kdc_hosts_from_dns(domain)
+    let kdc_hosts = detect_kdc_hosts_from_dns(domain);
+    warn!("detect_kdc_hosts: detected KDC hosts from DNS for domain `{domain}`: {:?}", kdc_hosts);
+    kdc_hosts
 }
 
 pub fn detect_kdc_host(domain: &str) -> Option<String> {
